@@ -1,11 +1,20 @@
+import math
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import re
+import sqlite3
+import hashlib
+import hmac
+import secrets
+import json
+from typing import Optional
 
 load_dotenv()
 
@@ -14,11 +23,556 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =========================================================
+# ACCOUNTS + SAVED TRIPS (SQLite)
+# =========================================================
+
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "roamly.db"
+)
+
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+
+    conn = db()
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            salt TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            from_location TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            people INTEGER NOT NULL,
+            total_cost REAL NOT NULL DEFAULT 0,
+            selection TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trip_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+    for column in ("ai_summary TEXT", "summary_hash TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE trips ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class SaveTripRequest(BaseModel):
+    from_location: str
+    destination: str
+    start_date: str
+    end_date: str
+    people: int
+    total_cost: float = 0
+    selection: Optional[dict] = None
+
+class ExpenseRequest(BaseModel):
+    category: str
+    amount: float
+    note: str = ""
+
+
+def hash_password(password, salt=None):
+
+    salt = salt or secrets.token_hex(16)
+
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        200_000
+    ).hex()
+
+    return salt, digest
+
+
+def create_session(conn, user_id):
+
+    token = secrets.token_urlsafe(32)
+
+    token_hash = hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+    expires_at = (
+        now_utc() + timedelta(days=30)
+    ).isoformat()
+
+    conn.execute(
+        "INSERT INTO sessions (token_hash, user_id, expires_at) "
+        "VALUES (?, ?, ?)",
+        (token_hash, user_id, expires_at)
+    )
+
+    return token
+
+
+def public_user(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"]
+    }
+
+
+def current_user(authorization: str = Header(default="")):
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Please sign in to continue."
+        )
+
+    token = authorization[7:].strip()
+
+    token_hash = hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT users.id, users.name, users.email, sessions.expires_at "
+        "FROM sessions JOIN users ON users.id = sessions.user_id "
+        "WHERE sessions.token_hash = ?",
+        (token_hash,)
+    ).fetchone()
+
+    conn.close()
+
+    if (
+        row is None
+        or datetime.fromisoformat(row["expires_at"]) < now_utc()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Your session has expired. Please sign in again."
+        )
+
+    return row
+
+
+# ---------------------------------------------------------
+# AUTH ROUTES
+# ---------------------------------------------------------
+
+@app.post("/auth/register")
+def register(data: RegisterRequest):
+
+    name = data.name.strip()
+    email = data.email.strip().lower()
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter your name."
+        )
+
+    if not EMAIL_PATTERN.match(email):
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a valid email address."
+        )
+
+    if len(data.password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters."
+        )
+
+    salt, digest = hash_password(data.password)
+
+    conn = db()
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO users "
+            "(name, email, salt, password_hash, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (name, email, salt, digest, now_utc().isoformat())
+        )
+
+        user_id = cursor.lastrowid
+        token = create_session(conn, user_id)
+        conn.commit()
+
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists."
+        )
+
+    conn.close()
+
+    return {
+        "token": token,
+        "user": {"id": user_id, "name": name, "email": email}
+    }
+
+
+@app.post("/auth/login")
+def login(data: LoginRequest):
+
+    email = data.email.strip().lower()
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT * FROM users WHERE email = ?",
+        (email,)
+    ).fetchone()
+
+    if row is None:
+        conn.close()
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password."
+        )
+
+    _, digest = hash_password(data.password, row["salt"])
+
+    if not hmac.compare_digest(digest, row["password_hash"]):
+        conn.close()
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password."
+        )
+
+    token = create_session(conn, row["id"])
+    conn.commit()
+    conn.close()
+
+    return {"token": token, "user": public_user(row)}
+
+
+@app.post("/auth/logout")
+def logout(authorization: str = Header(default="")):
+
+    if authorization.startswith("Bearer "):
+
+        token_hash = hashlib.sha256(
+            authorization[7:].strip().encode("utf-8")
+        ).hexdigest()
+
+        conn = db()
+        conn.execute(
+            "DELETE FROM sessions WHERE token_hash = ?",
+            (token_hash,)
+        )
+        conn.commit()
+        conn.close()
+
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+def me(user=Depends(current_user)):
+    return {"user": public_user(user)}
+
+
+# ---------------------------------------------------------
+# TRIP ROUTES
+# ---------------------------------------------------------
+
+@app.post("/trips")
+def save_trip(data: SaveTripRequest, user=Depends(current_user)):
+
+    conn = db()
+
+    cursor = conn.execute(
+        "INSERT INTO trips "
+        "(user_id, from_location, destination, start_date, end_date, "
+        "people, total_cost, selection, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            user["id"],
+            data.from_location.strip(),
+            data.destination.strip(),
+            data.start_date,
+            data.end_date,
+            data.people,
+            data.total_cost,
+            json.dumps(data.selection) if data.selection else None,
+            now_utc().isoformat()
+        )
+    )
+
+    conn.commit()
+    trip_id = cursor.lastrowid
+    conn.close()
+
+    return {"id": trip_id, "saved": True}
+
+
+@app.get("/trips")
+def list_trips(user=Depends(current_user)):
+
+    conn = db()
+
+    rows = conn.execute(
+        "SELECT * FROM trips WHERE user_id = ? ORDER BY id DESC",
+        (user["id"],)
+    ).fetchall()
+
+    conn.close()
+
+    trips = []
+
+    for row in rows:
+        trips.append({
+            "id": row["id"],
+            "from_location": row["from_location"],
+            "destination": row["destination"],
+            "start_date": row["start_date"],
+            "end_date": row["end_date"],
+            "people": row["people"],
+            "total_cost": row["total_cost"],
+            "selection": (
+                json.loads(row["selection"])
+                if row["selection"] else None
+            ),
+            "created_at": row["created_at"]
+        })
+
+    return {"trips": trips}
+
+
+@app.delete("/trips/{trip_id}")
+def delete_trip(trip_id: int, user=Depends(current_user)):
+
+    conn = db()
+
+    cursor = conn.execute(
+        "DELETE FROM trips WHERE id = ? AND user_id = ?",
+        (trip_id, user["id"])
+    )
+
+    conn.commit()
+    deleted = cursor.rowcount
+    conn.close()
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Trip not found."
+        )
+
+    return {"deleted": True}
+
+@app.put("/trips/{trip_id}")
+def update_trip(
+    trip_id: int,
+    data: SaveTripRequest,
+    user=Depends(current_user)
+):
+
+    conn = db()
+
+    cursor = conn.execute(
+        "UPDATE trips SET "
+        "from_location = ?, destination = ?, start_date = ?, "
+        "end_date = ?, people = ?, total_cost = ?, selection = ? "
+        "WHERE id = ? AND user_id = ?",
+        (
+            data.from_location.strip(),
+            data.destination.strip(),
+            data.start_date,
+            data.end_date,
+            data.people,
+            data.total_cost,
+            json.dumps(data.selection) if data.selection else None,
+            trip_id,
+            user["id"]
+        )
+    )
+
+    conn.commit()
+    updated = cursor.rowcount
+    conn.close()
+
+    if not updated:
+        raise HTTPException(
+            status_code=404,
+            detail="Trip not found."
+        )
+
+    return {"id": trip_id, "saved": True}
+
+# ---------------------------------------------------------
+# TRIP EXPENSES
+# ---------------------------------------------------------
+
+EXPENSE_CATEGORIES = {"local_transport", "food", "tourism", "shopping"}
+
+
+def trip_belongs_to_user(conn, trip_id, user_id):
+    row = conn.execute(
+        "SELECT id FROM trips WHERE id = ? AND user_id = ?",
+        (trip_id, user_id)
+    ).fetchone()
+    return row is not None
+
+
+@app.get("/trips/{trip_id}/expenses")
+def list_expenses(trip_id: int, user=Depends(current_user)):
+
+    conn = db()
+
+    if not trip_belongs_to_user(conn, trip_id, user["id"]):
+        conn.close()
+        raise HTTPException(status_code=404, detail="Trip not found.")
+
+    rows = conn.execute(
+        "SELECT id, category, amount, note, created_at "
+        "FROM expenses WHERE trip_id = ? AND user_id = ? "
+        "ORDER BY id DESC",
+        (trip_id, user["id"])
+    ).fetchall()
+
+    conn.close()
+
+    return {"expenses": [dict(row) for row in rows]}
+
+
+@app.post("/trips/{trip_id}/expenses")
+def add_expense(
+    trip_id: int,
+    data: ExpenseRequest,
+    user=Depends(current_user)
+):
+
+    if data.category not in EXPENSE_CATEGORIES:
+        raise HTTPException(status_code=400, detail="Invalid category.")
+
+    if not (0 < data.amount <= 10_000_000):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid amount."
+        )
+
+    conn = db()
+
+    if not trip_belongs_to_user(conn, trip_id, user["id"]):
+        conn.close()
+        raise HTTPException(status_code=404, detail="Trip not found.")
+
+    created = now_utc().isoformat()
+
+    cursor = conn.execute(
+        "INSERT INTO expenses "
+        "(trip_id, user_id, category, amount, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            trip_id,
+            user["id"],
+            data.category,
+            round(data.amount, 2),
+            data.note.strip()[:120],
+            created
+        )
+    )
+
+    conn.commit()
+    expense_id = cursor.lastrowid
+    conn.close()
+
+    return {
+        "id": expense_id,
+        "category": data.category,
+        "amount": round(data.amount, 2),
+        "note": data.note.strip()[:120],
+        "created_at": created
+    }
+
+
+@app.delete("/trips/{trip_id}/expenses/{expense_id}")
+def delete_expense(
+    trip_id: int,
+    expense_id: int,
+    user=Depends(current_user)
+):
+
+    conn = db()
+
+    cursor = conn.execute(
+        "DELETE FROM expenses "
+        "WHERE id = ? AND trip_id = ? AND user_id = ?",
+        (expense_id, trip_id, user["id"])
+    )
+
+    conn.commit()
+    deleted = cursor.rowcount
+    conn.close()
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Expense not found.")
+
+    return {"deleted": True}
 
 # =========================================================
 # MODELS
@@ -31,15 +585,28 @@ class TripRequest(BaseModel):
     end_date: str
     people: int
 
+class AttractionPoint(BaseModel):
+    name: str
+    latitude: float
+    longitude: float
+
+
+class PlaceRouteRequest(BaseModel):
+    hotel_name: str
+    hotel_latitude: float
+    hotel_longitude: float
+    places: list[AttractionPoint]
+
 class GroundTransportRequest(BaseModel):
     from_location: str
     destination: str
     journey_date: str
     people: int
 
-
-
-
+class WeatherAdviceRequest(BaseModel):
+    destination: str
+    daily_forecast: dict
+    transport_mode: Optional[str] = None
 
 # =========================================================
 # BASIC
@@ -87,6 +654,173 @@ def get_coordinates(place):
         "longitude": float(data[0]["lon"])
     }
 
+
+# =========================================================
+# WEATHER FORECAST
+# =========================================================
+
+@app.get("/weather")
+def get_weather(
+    destination: str,
+    start_date: str,
+    end_date: str
+):
+
+    # Validate dates
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError:
+        return {"error": "Invalid travel dates."}
+
+    if end < start:
+        return {"error": "End date cannot be before start date."}
+
+    # Open-Meteo supports forecasts up to 16 days.
+    today = date.today()
+    last_forecast_date = today + timedelta(days=15)
+
+    if end < today:
+        return {
+            "available": False,
+            "message": "These travel dates are in the past. A live forecast is unavailable."
+        }
+
+    if start > last_forecast_date:
+        return {
+            "available": False,
+            "message": "Weather forecasts are not available this far in advance. Check again closer to your trip."
+        }
+
+    # Use existing ROAMLY location search
+    coordinates = get_coordinates(destination)
+
+    if coordinates is None:
+        return {"error": "Could not identify the destination location."}
+
+    # Fetch actual weather forecast
+    url = "https://api.open-meteo.com/v1/forecast"
+
+    params = {
+        "latitude": coordinates["latitude"],
+        "longitude": coordinates["longitude"],
+        "daily": (
+            "weather_code,"
+            "temperature_2m_max,"
+            "temperature_2m_min,"
+            "precipitation_probability_max,"
+            "precipitation_sum,"
+            "wind_speed_10m_max"
+        ),
+        "start_date": max(start, today).isoformat(),
+        "end_date": end.isoformat(),
+        "timezone": "auto"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20
+        )
+        response.raise_for_status()
+        weather_data = response.json()
+
+    except requests.RequestException:
+        return {"error": "Weather service is temporarily unavailable."}
+
+    return {
+        "available": True,
+        "destination": destination,
+        "latitude": coordinates["latitude"],
+        "longitude": coordinates["longitude"],
+        "daily": weather_data.get("daily", {}),
+        "units": weather_data.get("daily_units", {}),
+        "source": "Open-Meteo"
+    }
+
+# =========================================================
+# AI WEATHER-BASED TRAVEL ADVICE
+# =========================================================
+
+@app.post("/weather-advice")
+def generate_weather_advice(request: WeatherAdviceRequest):
+
+    from huggingface_hub import InferenceClient
+
+    token = os.getenv("HF_TOKEN")
+
+    if not token:
+        return {
+            "error": "HF_TOKEN is not available to the FastAPI server."
+        }
+
+    try:
+
+        client = InferenceClient(api_key=token)
+
+        prompt = f"""
+You are ROAMLY, an intelligent AI travel assistant.
+
+Analyze the actual weather forecast below and give practical
+recommendations for the traveller.
+
+Destination: {request.destination}
+Selected transport: {request.transport_mode or "Not specified"}
+
+Actual daily weather forecast:
+{json.dumps(request.daily_forecast, ensure_ascii=False)}
+
+Give advice under these three headings:
+
+1. TRANSPORT
+- Suggest suitable ways to travel based on the forecast.
+- Explain when walking, cycling or road travel may be inconvenient.
+- Consider the selected transport mode where relevant.
+- Do not claim that roads or transport services are closed.
+
+2. SIGHTSEEING
+- Suggest whether outdoor sightseeing is suitable.
+- Recommend prioritizing indoor activities when weather conditions
+  make outdoor visits less comfortable.
+- Suggest suitable times of day when supported by the forecast.
+
+3. DAILY TRAVEL TIPS
+- Give practical suggestions based on the forecast.
+- Mention useful items to carry, such as an umbrella, sunscreen
+  or water, only when relevant.
+- Mention any weather-related precautions.
+
+IMPORTANT:
+- Base every recommendation on the supplied forecast.
+- Do not invent weather conditions or forecast details.
+- Do not invent attraction names, closures or transport disruptions.
+- Keep the advice concise, specific and easy to follow.
+- If forecast information is missing, clearly say so.
+
+Return only the recommendations with the three headings.
+"""
+
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        )
+
+        return {
+            "destination": request.destination,
+            "advice": response.choices[0].message.content
+        }
+
+    except Exception as e:
+
+        return {
+            "error": str(e)
+        }
 
 def get_road_route(from_location, destination):
     start = get_coordinates(from_location)
@@ -177,105 +911,6 @@ def railradar_headers():
     return {
         "Authorization": f"Bearer {api_key}"
     }
-
-def get_train_fare(
-    train_number,
-    source_code,
-    destination_code,
-    journey_date,
-    class_code
-):
-    """
-    Get the live/current fare for one train and one class
-    from RailRadar.
-    """
-
-    api_key = os.getenv("RAILRADAR_KEY")
-
-    if not api_key:
-        print("RAILRADAR_KEY is not available.")
-        return None
-
-    try:
-
-        response = requests.get(
-            f"https://api.railradar.in/v1/trains/{train_number}/fare",
-            params={
-                "source": source_code,
-                "destination": destination_code,
-                "journeyDate": journey_date,
-                "classCode": class_code,
-                "quotaCode": "GN"
-            },
-            headers={
-                "Authorization":
-                    f"Bearer {api_key}"
-            },
-            timeout=15
-        )
-
-        print(
-            f"FARE REQUEST: "
-            f"{train_number} "
-            f"{class_code} "
-            f"-> HTTP {response.status_code}"
-        )
-
-        if response.status_code != 200:
-
-            print(
-                f"FARE ERROR {train_number} "
-                f"{class_code}:",
-                response.text[:500]
-            )
-
-            return None
-
-        data = response.json()
-
-        fare_data = data.get(
-            "data"
-        )
-
-        if not fare_data:
-
-            print(
-                f"No fare data for "
-                f"{train_number} "
-                f"{class_code}"
-            )
-
-            return None
-
-        total_fare = fare_data.get(
-            "totalFare"
-        )
-
-        if total_fare is None:
-
-            print(
-                f"No totalFare for "
-                f"{train_number} "
-                f"{class_code}"
-            )
-
-            return None
-
-        return round(
-            float(total_fare)
-        )
-
-    except Exception as e:
-
-        print(
-            f"Fare error "
-            f"{train_number} "
-            f"{class_code}:",
-            e
-        )
-
-        return None
-
 
 def find_railway_station(place):
     """
@@ -482,745 +1117,182 @@ def find_railway_station(place):
 
         return None
 
+
 @app.post("/ground-transport")
 def ground_transport(request: GroundTransportRequest):
 
     from_location = request.from_location.strip()
     destination = request.destination.strip()
-    journey_date = request.journey_date
-    people = request.people
 
-    options = []
+    # =====================================================
+    # TRAIN STATION DETAILS ONLY
+    # No live train fare or class fare fetching.
+    # =====================================================
+
+    source_station = find_railway_station(from_location)
+    destination_station = find_railway_station(destination)
+
+    station_details = {
+        "departure": None,
+        "arrival": None
+    }
+
     train_error = None
 
+    if source_station:
+        station_details["departure"] = {
+            "name": source_station.get("name"),
+            "code": source_station.get("code"),
+            "city": source_station.get("city") or from_location
+        }
+
+    if destination_station:
+        station_details["arrival"] = {
+            "name": destination_station.get("name"),
+            "code": destination_station.get("code"),
+            "city": destination_station.get("city") or destination
+        }
+
+    if not source_station:
+        train_error = (
+            f"Could not find a railway station for {from_location}."
+        )
+
+    elif not destination_station:
+        train_error = (
+            f"Could not find a railway station for {destination}."
+        )
+
     # =====================================================
-    # 🚆 TRAIN
+    # CAR — ROAD ROUTE + FUEL COST ESTIMATOR
     # =====================================================
 
-    api_key = os.getenv("RAILRADAR_KEY")
+    route = get_road_route(from_location, destination)
 
-    if not api_key:
+    if route is not None:
+        distance_km = round(route["distance_km"], 2)
+        driving_hours = round(route["duration_hours"], 2)
+        route_error = None
+    else:
+        distance_km = None
+        driving_hours = None
+        route_error = "Could not calculate the road route."
 
-        train_error = "RAILRADAR_KEY is not available."
+    directions_url = (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={quote_plus(from_location)}"
+        f"&destination={quote_plus(destination)}"
+        "&travelmode=driving"
+    )
+
+    # =====================================================
+    # FUEL PRICE
+    # =====================================================
+
+    petrol_price = None
+    fuel_source = "manual"
+    fuel_location = from_location
+    fuel_updated_at = None
+    fuel_error = None
+
+    api_mitra_key = os.getenv("APIMITRA_KEY")
+
+    if api_mitra_key:
+        try:
+            fuel_response = requests.get(
+                "https://api.apimitra.in/fuel",
+                params={"city": from_location},
+                headers={"x-api-key": api_mitra_key},
+                timeout=10
+            )
+
+            fuel_response.raise_for_status()
+            fuel_data = fuel_response.json()
+
+            price_data = fuel_data.get("price", {})
+            petrol_data = price_data.get("petrol", {})
+            candidate_price = petrol_data.get("price")
+
+            if candidate_price is not None:
+                candidate_price = float(candidate_price)
+
+                if candidate_price > 0:
+                    petrol_price = candidate_price
+                    fuel_source = "API Mitra"
+                    fuel_location = (
+                        price_data.get("location")
+                        or from_location
+                    )
+                    fuel_updated_at = (
+                        fuel_data.get("fetched_at")
+                        or fuel_data.get("updated_at")
+                    )
+                else:
+                    fuel_error = (
+                        "The API returned an invalid petrol price."
+                    )
+            else:
+                fuel_error = (
+                    "Live petrol price was not included in the API response."
+                )
+
+        except (requests.RequestException, ValueError, TypeError) as e:
+            fuel_error = "Live petrol price is currently unavailable."
+            print("ROAMLY fuel price error:", e)
 
     else:
-
-        # -------------------------------------------------
-        # FIND SOURCE AND DESTINATION STATIONS
-        # -------------------------------------------------
-
-        source_station = find_railway_station(
-            from_location
-        )
-
-        destination_station = find_railway_station(
-            destination
-        )
-
-        if not source_station:
-
-            train_error = (
-                f"Could not find a railway station "
-                f"for {from_location}."
-            )
-
-        elif not destination_station:
-
-            train_error = (
-                f"Could not find a railway station "
-                f"for {destination}."
-            )
-
-        else:
-
-            source_code = str(
-                source_station.get("code", "")
-            ).upper()
-
-            destination_code = str(
-                destination_station.get("code", "")
-            ).upper()
-
-            print(
-                "================================================="
-            )
-
-            print(
-                "ROAMLY TRAIN SEARCH"
-            )
-
-            print(
-                "Source:",
-                from_location,
-                "->",
-                source_code
-            )
-
-            print(
-                "Destination:",
-                destination,
-                "->",
-                destination_code
-            )
-
-            print(
-                "Journey date:",
-                journey_date
-            )
-
-            print(
-                "================================================="
-            )
-
-            # -------------------------------------------------
-            # STEP 1
-            # DIRECT POINT-TO-POINT SEARCH
-            # -------------------------------------------------
-
-            train_list = []
-
-            try:
-
-                url = (
-                    "https://api.railradar.in/v1/"
-                    f"trains/between/"
-                    f"{source_code}/"
-                    f"{destination_code}"
-                )
-
-                response = requests.get(
-                    url,
-                    params={
-                        "date": journey_date,
-                        "byCity": "false",
-                        "live": "false"
-                    },
-                    headers={
-                        "Authorization":
-                            f"Bearer {api_key}"
-                    },
-                    timeout=20
-                )
-
-                print(
-                    "DIRECT TRAIN API STATUS:",
-                    response.status_code
-                )
-
-                print(
-                    "DIRECT TRAIN API RESPONSE:",
-                    response.text[:2000]
-                )
-
-                if response.status_code == 200:
-
-                    data = response.json()
-
-                    train_list = (
-                        data
-                        .get("data", {})
-                        .get("trains", [])
-                    )
-
-            except Exception as e:
-
-                print(
-                    "Direct train search error:",
-                    e
-                )
-
-            # -------------------------------------------------
-            # STEP 2
-            # IF DATE FILTER RETURNS NOTHING,
-            # TRY WITHOUT DATE
-            # -------------------------------------------------
-
-            if not train_list:
-
-                print(
-                    "No trains with date filter."
-                )
-
-                print(
-                    "Retrying without date filter..."
-                )
-
-                try:
-
-                    url = (
-                        "https://api.railradar.in/v1/"
-                        f"trains/between/"
-                        f"{source_code}/"
-                        f"{destination_code}"
-                    )
-
-                    response = requests.get(
-                        url,
-                        params={
-                            "byCity": "false",
-                            "live": "false"
-                        },
-                        headers={
-                            "Authorization":
-                                f"Bearer {api_key}"
-                        },
-                        timeout=20
-                    )
-
-                    print(
-                        "NO-DATE TRAIN API STATUS:",
-                        response.status_code
-                    )
-
-                    print(
-                        "NO-DATE TRAIN API RESPONSE:",
-                        response.text[:2000]
-                    )
-
-                    if response.status_code == 200:
-
-                        data = response.json()
-
-                        train_list = (
-                            data
-                            .get("data", {})
-                            .get("trains", [])
-                        )
-
-                except Exception as e:
-
-                    print(
-                        "No-date train search error:",
-                        e
-                    )
-
-            # -------------------------------------------------
-            # STEP 3
-            # LAST DISCOVERY METHOD:
-            # CITY-WIDE SEARCH
-            # -------------------------------------------------
-
-            if not train_list:
-
-                print(
-                    "No direct-station trains found."
-                )
-
-                print(
-                    "Trying city-wide RailRadar search..."
-                )
-
-                try:
-
-                    url = (
-                        "https://api.railradar.in/v1/"
-                        f"trains/between/"
-                        f"{source_code}/"
-                        f"{destination_code}"
-                    )
-
-                    response = requests.get(
-                        url,
-                        params={
-                            "date": journey_date,
-                            "byCity": "true",
-                            "live": "false"
-                        },
-                        headers={
-                            "Authorization":
-                                f"Bearer {api_key}"
-                        },
-                        timeout=20
-                    )
-
-                    print(
-                        "CITY-WIDE TRAIN API STATUS:",
-                        response.status_code
-                    )
-
-                    print(
-                        "CITY-WIDE TRAIN API RESPONSE:",
-                        response.text[:2000]
-                    )
-
-                    if response.status_code == 200:
-
-                        data = response.json()
-
-                        train_list = (
-                            data
-                            .get("data", {})
-                            .get("trains", [])
-                        )
-
-                except Exception as e:
-
-                    print(
-                        "City-wide train search error:",
-                        e
-                    )
-
-            print(
-                "FINAL TRAIN COUNT:",
-                len(train_list)
-            )
-
-            # -------------------------------------------------
-            # STEP 4
-            # PROCESS EVERY TRAIN
-            # -------------------------------------------------
-
-            for train_item in train_list:
-
-                train_info = train_item.get(
-                    "train",
-                    {}
-                )
-
-                train_number = str(
-                    train_info.get(
-                        "number",
-                        ""
-                    )
-                )
-
-                if not train_number:
-                    continue
-
-                train_name = train_info.get(
-                    "name",
-                    "Indian Railways Train"
-                )
-
-                from_info = train_item.get(
-                    "from",
-                    {}
-                )
-
-                to_info = train_item.get(
-                    "to",
-                    {}
-                )
-
-                departure = from_info.get(
-                    "departure",
-                    "N/A"
-                )
-
-                arrival = to_info.get(
-                    "arrival",
-                    "N/A"
-                )
-
-                duration_minutes = train_item.get(
-                    "duration"
-                )
-
-                if duration_minutes is not None:
-
-                    hours = int(
-                        duration_minutes // 60
-                    )
-
-                    minutes = int(
-                        duration_minutes % 60
-                    )
-
-                    duration = (
-                        f"{hours}h {minutes}m"
-                    )
-
-                else:
-
-                    duration = "N/A"
-
-                # -------------------------------------------------
-                # LIVE INFORMATION
-                # -------------------------------------------------
-
-                live_info = train_item.get(
-                    "live"
-                )
-
-                live_status = None
-                delay_minutes = 0
-
-                if isinstance(
-                    live_info,
-                    dict
-                ):
-
-                    live_status = live_info.get(
-                        "type"
-                    )
-
-                    delay_minutes = (
-                        live_info.get(
-                            "delayMinutes",
-                            0
-                        )
-                        or 0
-                    )
-
-                # -------------------------------------------------
-                # FARES
-                # -------------------------------------------------
-
-                class_fares = {}
-
-                for class_code in [
-                    "SL",
-                    "3A",
-                    "2A",
-                    "1A"
-                ]:
-
-                    fare = get_train_fare(
-                        train_number,
-                        source_code,
-                        destination_code,
-                        journey_date,
-                        class_code
-                    )
-
-                    if fare is not None:
-
-                        class_fares[
-                            class_code
-                        ] = {
-
-                            "per_person": fare,
-
-                            "total": round(
-                                fare * people
-                            )
-                        }
-
-                # -------------------------------------------------
-                # AVERAGE FARE
-                # -------------------------------------------------
-
-                if class_fares:
-
-                    average_price = round(
-                        sum(
-                            item["per_person"]
-                            for item
-                            in class_fares.values()
-                        )
-                        /
-                        len(class_fares)
-                    )
-
-                else:
-
-                    average_price = None
-
-                # -------------------------------------------------
-                # ADD TRAIN
-                #
-                # IMPORTANT:
-                # We DO NOT discard the train if fare lookup
-                # fails.
-                # -------------------------------------------------
-
-                options.append({
-
-                    "mode": "Train",
-
-                    "icon": "🚆",
-
-                    "data_type": "Live",
-
-                    "name": train_name,
-
-                    "train_number":
-                        train_number,
-
-                    "departure":
-                        departure,
-
-                    "arrival":
-                        arrival,
-
-                    "duration":
-                        duration,
-
-                    "distance_km":
-                        train_item.get(
-                            "distance"
-                        ),
-
-                    "train_type":
-                        train_info.get(
-                            "type",
-                            "Train"
-                        ),
-
-                    "classes":
-                        class_fares,
-
-                    "average_price":
-                        average_price,
-
-                    "live_status":
-                        live_status,
-
-                    "delay_minutes":
-                        delay_minutes,
-
-                    "view_url":
-                        "https://railradar.in/"
-                        f"train-status/{train_number}"
-                })
-
-            # -------------------------------------------------
-            # TRAIN CATEGORISATION
-            # -------------------------------------------------
-
-            priced_trains = [
-                option
-                for option in options
-                if (
-                    option.get("mode") == "Train"
-                    and
-                    option.get(
-                        "average_price"
-                    ) is not None
-                )
-            ]
-
-            if priced_trains:
-
-                prices = sorted(
-                    option["average_price"]
-                    for option in priced_trains
-                )
-
-                total_priced = len(
-                    prices
-                )
-
-                for option in priced_trains:
-
-                    price = option[
-                        "average_price"
-                    ]
-
-                    if total_priced == 1:
-
-                        category = "Standard"
-
-                    elif total_priced == 2:
-
-                        if price == prices[0]:
-
-                            category = "Economy"
-
-                        else:
-
-                            category = "Premium"
-
-                    else:
-
-                        first_index = (
-                            (total_priced - 1)
-                            // 3
-                        )
-
-                        second_index = (
-                            2 *
-                            (total_priced - 1)
-                            // 3
-                        )
-
-                        first_cut = prices[
-                            first_index
-                        ]
-
-                        second_cut = prices[
-                            second_index
-                        ]
-
-                        if price <= first_cut:
-
-                            category = "Economy"
-
-                        elif price <= second_cut:
-
-                            category = "Standard"
-
-                        else:
-
-                            category = "Premium"
-
-                    option[
-                        "category"
-                    ] = category
-
-            # Give trains without fares a clear category.
-            for option in options:
-
-                if (
-                    option.get("mode") == "Train"
-                    and
-                    option.get(
-                        "average_price"
-                    ) is None
-                ):
-
-                    option[
-                        "category"
-                    ] = "Fare unavailable"
-
-    # =====================================================
-    # 🚗 CAR
-    # =====================================================
-
-    try:
-
-        route = get_road_route(
-            from_location,
-            destination
-        )
-
-        if route is not None:
-
-            distance_km = round(
-                route["distance_km"],
-                2
-            )
-
-            driving_hours = round(
-                route["duration_hours"],
-                2
-            )
-
-            api_mitra_key = os.getenv(
-                "APIMITRA_KEY"
-            )
-
-            if api_mitra_key:
-
-                fuel_response = requests.get(
-                    "https://api.apimitra.in/fuel",
-                    params={
-                        "city":
-                            from_location
-                    },
-                    headers={
-                        "x-api-key":
-                            api_mitra_key
-                    },
-                    timeout=10
-                )
-
-                fuel_response.raise_for_status()
-
-                fuel_data = (
-                    fuel_response.json()
-                )
-
-                petrol_price = None
-
-                if "price" in fuel_data:
-
-                    petrol_price = (
-                        fuel_data[
-                            "price"
-                        ]
-                        .get(
-                            "petrol",
-                            {}
-                        )
-                        .get(
-                            "price"
-                        )
-                    )
-
-                if petrol_price:
-
-                    mileage = 15
-
-                    litres_needed = (
-                        distance_km /
-                        mileage
-                    )
-
-                    fuel_cost_one_way = (
-                        litres_needed *
-                        float(
-                            petrol_price
-                        )
-                    )
-
-                    fuel_cost_round_trip = (
-                        fuel_cost_one_way *
-                        2
-                    )
-
-                    options.append({
-
-                        "mode": "Car",
-
-                        "icon": "🚗",
-
-                        "data_type":
-                            "Calculated estimate",
-
-                        "cost":
-                            round(
-                                fuel_cost_round_trip
-                            ),
-
-                        "fuel_price":
-                            float(
-                                petrol_price
-                            ),
-
-                        "distance_km":
-                            distance_km,
-
-                        "mileage":
-                            mileage,
-
-                        "estimated_time":
-                            driving_hours
-                    })
-
-    except Exception as e:
-
-        print(
-            "Car API error:",
-            e
+        fuel_error = (
+            "APIMITRA_KEY is not configured. "
+            "Enter the fuel price manually."
         )
 
     # =====================================================
-    # FINAL RESPONSE
+    # FINAL TRANSPORT OPTIONS
     # =====================================================
 
-    train_count = len([
-        option
-        for option in options
-        if option.get("mode") == "Train"
-    ])
+    options = [{
+        "mode": "Car",
+        "icon": "🚗",
+        "name": "Personal car",
+        "data_type": "Estimated fuel cost",
+
+        "distance_km": distance_km,
+        "estimated_time": driving_hours,
+        "route_error": route_error,
+        "directions_url": directions_url,
+
+        "fuel_price": petrol_price,
+        "fuel_source": fuel_source,
+        "fuel_location": fuel_location,
+        "fuel_updated_at": fuel_updated_at,
+        "fuel_error": fuel_error,
+
+        "mileage_min": 10,
+        "mileage_average": 15,
+        "mileage_max": 25,
+        "cost": None
+    }]
+
+    # =====================================================
+    # RESPONSE
+    # =====================================================
 
     return {
+        "options": options,
 
-        "options":
-            options,
+        # Frontend uses these details to create the station card.
+        "station_details": station_details,
 
-        "train_error":
-            train_error,
+        "train_error": train_error,
 
-        "train_count":
-            train_count,
+        # No live train fare options are returned.
+        "train_count": 0,
 
-        "data_type":
-            "Live train data + "
-            "live available fares + "
-            "calculated car estimate"
+        "data_type": (
+            "Railway station details + calculated car estimate"
+        )
     }
+
 
 
 
@@ -1865,6 +1937,332 @@ def places_to_visit(destination: str):
         "places": places[:20]
     }
 
+
+# =========================================================
+# FOOD NEARBY — RESTAURANTS VIA SERPAPI GOOGLE MAPS
+# =========================================================
+
+@app.get("/food")
+def food_nearby(
+    destination: str,
+    near: str = "",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    veg_only: bool = False
+):
+    api_key = os.getenv("SERPAPI_KEY")
+
+    if not api_key:
+        return {"error": "SERPAPI_KEY is missing."}
+
+    # Prefer the exact hotel/attraction coordinates.
+    if latitude is not None and longitude is not None:
+        center = {
+            "latitude": latitude,
+            "longitude": longitude
+        }
+        located_by = "coordinates"
+    else:
+        # Fall back to the supplied address or destination.
+        search_location = near.strip() or destination
+
+        center = get_coordinates(search_location)
+
+        if center is None:
+            return {"error": "Could not identify the food search location."}
+
+        located_by = "nearby" if near.strip() else "destination"
+
+    search_area = near.strip() or destination
+
+    query = (
+        f"vegetarian restaurants near {search_area}"
+        if veg_only
+        else f"restaurants near {search_area}"
+    )
+
+    params = {
+        "engine": "google_maps",
+        "type": "search",
+        "q": query,
+        "ll": (
+            f"@{center['latitude']},"
+            f"{center['longitude']},15z"
+        ),
+        "api_key": api_key,
+        "hl": "en"
+    }
+
+    try:
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params=params,
+            timeout=30
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+    except requests.RequestException as e:
+        print("Food search error:", e)
+        return {"error": "Could not fetch nearby restaurants."}
+
+    if data.get("error"):
+        return {"error": data["error"]}
+
+    restaurants = []
+
+    def calculate_distance(lat1, lon1, lat2, lon2):
+        earth_radius = 6371
+
+        d_lat = math.radians(lat2 - lat1)
+        d_lon = math.radians(lon2 - lon1)
+
+        a = (
+            math.sin(d_lat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(d_lon / 2) ** 2
+        )
+
+        return 2 * earth_radius * math.asin(
+            math.sqrt(a)
+        )
+
+    for place in data.get("local_results", []):
+
+        gps = place.get("gps_coordinates") or {}
+
+        lat = gps.get("latitude")
+        lon = gps.get("longitude")
+
+        if lat is None or lon is None:
+            continue
+
+        distance = calculate_distance(
+            center["latitude"],
+            center["longitude"],
+            float(lat),
+            float(lon)
+        )
+
+        # Keep restaurants within 2.5 km.
+        if distance > 2.5:
+            continue
+
+        links = place.get("links") or {}
+
+        maps_link = links.get("directions") or (
+            "https://www.google.com/maps/search/?api=1&query="
+            + quote_plus(place.get("title", "Restaurant"))
+        )
+
+        restaurants.append({
+            "name": place.get("title", "Restaurant"),
+            "rating": place.get("rating", "Not available"),
+            "reviews": place.get("reviews", 0),
+            "price": place.get("price", ""),
+            "distance_km": round(distance, 2),
+            "type": place.get("type", "Restaurant"),
+            "address": place.get("address", ""),
+            "maps_link": maps_link
+        })
+
+    # Highest-rated places first.
+    restaurants.sort(
+        key=lambda r: (
+            float(r["rating"])
+            if isinstance(r["rating"], (int, float))
+            else 0,
+            -r["distance_km"]
+        ),
+        reverse=True
+    )
+
+    return {
+        "success": True,
+        "located_by": located_by,
+        "count": len(restaurants),
+        "restaurants": restaurants[:15]
+    }
+
+
+@app.post("/optimize-place-route")
+def optimize_place_route(request: PlaceRouteRequest):
+
+    places = request.places[:20]
+
+    if not places:
+        return {
+            "success": False,
+            "error": "No attractions were provided for route optimization."
+        }
+
+    # Hotel is always the starting point.
+    coordinates = [
+        f"{request.hotel_longitude},{request.hotel_latitude}"
+    ]
+
+    for place in places:
+        coordinates.append(
+            f"{place.longitude},{place.latitude}"
+        )
+
+    coordinate_string = ";".join(coordinates)
+
+    # Get real driving distances and durations between all points.
+    table_url = (
+        "https://router.project-osrm.org/table/v1/driving/"
+        f"{coordinate_string}"
+    )
+
+    try:
+        table_response = requests.get(
+            table_url,
+            params={
+                "annotations": "distance,duration"
+            },
+            timeout=30
+        )
+
+        table_response.raise_for_status()
+        table_data = table_response.json()
+
+    except requests.RequestException as e:
+        print("OSRM table request failed:", e)
+
+        return {
+            "success": False,
+            "error": "Could not calculate road travel times."
+        }
+
+    if (
+        table_data.get("code") != "Ok"
+        or not table_data.get("durations")
+    ):
+        return {
+            "success": False,
+            "error": "Road travel data is unavailable for these locations."
+        }
+
+    durations = table_data["durations"]
+    distances = table_data["distances"]
+
+    # Greedy nearest-next-stop optimization.
+    # Start at hotel (index 0), then repeatedly choose
+    # the unvisited attraction with the shortest driving time.
+    current = 0
+    unvisited = set(range(1, len(coordinates)))
+
+    ordered_indices = []
+    total_distance = 0
+    total_duration = 0
+
+    while unvisited:
+
+        possible_stops = [
+            index
+            for index in unvisited
+            if durations[current][index] is not None
+            and distances[current][index] is not None
+        ]
+
+        if not possible_stops:
+            break
+
+        next_stop = min(
+            possible_stops,
+            key=lambda index: durations[current][index]
+        )
+
+        total_duration += durations[current][next_stop]
+        total_distance += distances[current][next_stop]
+
+        ordered_indices.append(next_stop)
+        unvisited.remove(next_stop)
+
+        current = next_stop
+
+    if not ordered_indices:
+        return {
+            "success": False,
+            "error": "No reachable attractions could be arranged into a route."
+        }
+
+    # Build the ordered attraction list.
+    ordered_places = []
+
+    for position, index in enumerate(ordered_indices, start=1):
+
+        place = places[index - 1]
+
+        ordered_places.append({
+            "sequence": position,
+            "name": place.name,
+            "latitude": place.latitude,
+            "longitude": place.longitude
+        })
+
+    # Request the complete road route in the optimized order.
+    ordered_coordinates = [
+        coordinates[0]
+    ] + [
+        coordinates[index]
+        for index in ordered_indices
+    ]
+
+    route_url = (
+        "https://router.project-osrm.org/route/v1/driving/"
+        + ";".join(ordered_coordinates)
+    )
+
+    route_geometry = None
+
+    try:
+        route_response = requests.get(
+            route_url,
+            params={
+                "overview": "full",
+                "geometries": "geojson"
+            },
+            timeout=30
+        )
+
+        route_response.raise_for_status()
+        route_data = route_response.json()
+
+        if (
+            route_data.get("code") == "Ok"
+            and route_data.get("routes")
+        ):
+            route = route_data["routes"][0]
+
+            total_distance = route["distance"]
+            total_duration = route["duration"]
+
+            route_geometry = route.get("geometry")
+
+    except requests.RequestException as e:
+        print("OSRM route request failed:", e)
+
+    return {
+        "success": True,
+        "starting_point": request.hotel_name,
+        "places": ordered_places,
+        "total_places": len(ordered_places),
+        "unreachable_places": len(unvisited),
+        "total_distance_km": round(total_distance / 1000, 2),
+        "total_travel_time_minutes": round(total_duration / 60),
+        "route_geometry": route_geometry,
+        "optimization": "Shortest-next-stop driving-time heuristic",
+        "note": (
+            "This is an optimized suggested sequence, "
+            "not a guaranteed globally shortest route. "
+            "Opening hours and attraction visit durations "
+            "are not included."
+        )
+    }
+
 # =========================================================
 # LOCATION
 # =========================================================
@@ -1983,7 +2381,7 @@ def search_flights(
     from_airport: str,
     to_airport: str,
     outbound_date: str,
-    return_date: str,
+    return_date: Optional[str] = None,
     adults: int = 1
 ):
 
@@ -1994,22 +2392,296 @@ def search_flights(
     if not api_key:
         return {"error": "SERPAPI_KEY is not available."}
 
+    params = {
+        "engine": "google_flights",
+        "departure_id": from_airport,
+        "arrival_id": to_airport,
+        "outbound_date": outbound_date,
+        "adults": adults,
+        "currency": "INR",
+        "hl": "en",
+        "type": "2"          # 2 = one way
+    }
+
+    # Only a real return date makes it a round-trip search.
+    if return_date:
+        params["return_date"] = return_date
+        params["type"] = "1"  # 1 = round trip
+
     try:
         client = serpapi.Client(api_key=api_key)
-
-        results = client.search({
-            "engine": "google_flights",
-            "departure_id": from_airport,
-            "arrival_id": to_airport,
-            "outbound_date": outbound_date,
-            "return_date": return_date,
-            "adults": adults,
-            "currency": "INR",
-            "hl": "en",
-            "type": "1"
-        })
-
-        return results
+        return client.search(params)
 
     except Exception as e:
         return {"error": str(e)}
+
+# =========================================================
+# AI TRIP SUMMARY (MY TRIPS CARDS)
+# =========================================================
+
+def fmt_date(value):
+    try:
+        parsed = date.fromisoformat(str(value)[:10])
+        return f"{parsed.day} {parsed.strftime('%b %Y')}"
+    except ValueError:
+        return str(value or "")
+
+
+def split_datetime(value):
+    """'2026-11-20 13:00' -> ('20 Nov 2026', '13:00')"""
+
+    text = str(value or "").strip().replace("T", " ")
+
+    if not text:
+        return "", ""
+
+    parts = text.split(" ")
+    day = fmt_date(parts[0]) if len(parts[0]) >= 10 else ""
+    clock = parts[1][:5] if len(parts) > 1 else ""
+
+    return day, clock
+
+
+def rupees(value):
+    return "₹{:,.0f}".format(float(value or 0))
+
+def describe_leg(leg, places, from_place, to_place, fallback_date):
+
+    if not leg:
+        return None
+
+    mode = leg.get("mode") or "Transport"
+    departure_point = ((places or {}).get("departure") or {}).get("name")
+
+    return {
+        "mode": mode,
+        "date": fallback_date,
+        "place": departure_point or from_place,
+        "from": from_place,
+        "to": to_place
+    }
+
+
+def build_trip_facts(row):
+
+    selection = json.loads(row["selection"]) if row["selection"] else {}
+    selection = selection or {}
+
+    transport = selection.get("transport") or {}
+    hotel = selection.get("hotel") or {}
+    route = selection.get("route_details") or {}
+
+    def places_for(leg, key):
+        """Airport / station saved for this leg of the journey."""
+
+        if not leg:
+            return None
+
+        is_flight = leg.get("mode") == "Flight"
+        legs = route.get("flightLegs" if is_flight else "trainLegs") or {}
+
+        found = legs.get(key)
+
+        # Older saved trips only stored the departure details.
+        if not found and key == "departure":
+            found = route.get("flight" if is_flight else "train")
+
+        return found
+
+    start_text, end_text = row["start_date"], row["end_date"]
+
+    try:
+        nights = max(0, (
+            date.fromisoformat(end_text) - date.fromisoformat(start_text)
+        ).days)
+    except ValueError:
+        nights = 0
+
+    departure = transport.get("departure") or (
+        transport if transport.get("mode") else None
+    )
+    returning = transport.get("return")
+
+    facts = {
+        "trip": {
+            "from": row["from_location"],
+            "destination": row["destination"],
+            "start": fmt_date(start_text),
+            "end": fmt_date(end_text),
+            "nights": nights,
+            "days": nights + 1,
+            "travelers": row["people"],
+            "total_cost": round(row["total_cost"] or 0)
+        },
+        "departure": describe_leg(
+            departure, places_for(departure, "departure"),
+            row["from_location"], row["destination"], fmt_date(start_text)
+        ),
+        "return": describe_leg(
+            returning, places_for(returning, "return"),
+            row["destination"], row["from_location"], fmt_date(end_text)
+        ),
+        "hotel": None
+    }
+
+    if hotel.get("name"):
+        facts["hotel"] = {
+            "name": hotel["name"],
+            "rooms": int(hotel.get("rooms") or 1),
+            "check_in": fmt_date(start_text),
+            "check_out": fmt_date(end_text),
+            "nights": nights,
+            "cost": round(float(hotel.get("price") or 0))
+        }
+
+    return facts
+
+
+def leg_sentence(leg, intro):
+
+    if not leg:
+        return ""
+
+    mode = leg["mode"]
+
+    if mode in ("Flight", "Train"):
+        return (
+            f"{intro} board your {mode.lower()} on {leg['date']} "
+            f"at {leg['place']}."
+        )
+
+    return (
+        f"{intro} set out by {mode.lower()} from {leg['from']} "
+        f"on {leg['date']}."
+    )
+
+def compose_trip_summary(facts):
+    """Plain, fully factual summary. Also the fallback when AI is off."""
+
+    trip = facts["trip"]
+    hotel = facts["hotel"]
+    lines = []
+
+    lines.append(leg_sentence(facts["departure"], "You will"))
+
+    if facts["return"]:
+        lines.append(leg_sentence(
+            facts["return"], "For your return, you will"
+        ))
+
+    if hotel:
+        rooms = hotel["rooms"]
+
+        lines.append(
+            f"You have booked {rooms} room{'s' if rooms != 1 else ''} at "
+            f"{hotel['name']} from {hotel['check_in']} to "
+            f"{hotel['check_out']}."
+        )
+
+    lines = [line for line in lines if line]
+
+    # Nothing selected yet: a short overview so the card is never empty.
+    if not lines:
+        lines.append(
+            f"Your trip from {trip['from']} to {trip['destination']} runs "
+            f"from {trip['start']} to {trip['end']} for "
+            f"{trip['travelers']} traveler(s)."
+        )
+
+    return " ".join(lines)
+
+def ai_text(prompt):
+    token = os.getenv("HF_TOKEN")
+
+    if not token:
+        return None
+
+    try:
+        from huggingface_hub import InferenceClient
+
+        client = InferenceClient(api_key=token)
+
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return (response.choices[0].message.content or "").strip()
+
+    except Exception as e:
+        print("AI summary failed:", e)
+        return None
+
+
+@app.get("/trips/{trip_id}/summary")
+def trip_summary(trip_id: int, user=Depends(current_user)):
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT * FROM trips WHERE id = ? AND user_id = ?",
+        (trip_id, user["id"])
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Trip not found.")
+
+    facts = build_trip_facts(row)
+
+    # Regenerate only when the saved trip actually changed.
+    facts_hash = hashlib.sha256(
+        json.dumps({"v": 3, "facts": facts}, sort_keys=True).encode()
+    ).hexdigest()
+
+    if row["summary_hash"] == facts_hash and row["ai_summary"]:
+        conn.close()
+        return {"summary": row["ai_summary"], "ai_used": True}
+
+    draft = compose_trip_summary(facts)
+
+    prompt = (
+        "You are ROAMLY, a friendly travel assistant.\n"
+        "Rewrite the trip draft below as one short, warm summary of 3 to 5 "
+        "sentences, addressed to the traveller as 'you'.\n"
+        "Start directly with the first sentence of the draft. Do not add "
+        "any introduction or greeting.\n"
+        "Rules:\n"
+        "- Keep every date, time, airport, name, room count and amount "
+        "exactly as written in the draft.\n"
+        "- Do not add any new facts, prices, times or places.\n"
+        "- You may end with ONE short practical reminder that fits the "
+        "chosen transport (for example arriving early at the airport or "
+        "station).\n"
+        "- Plain text only: no markdown, bullet points or emojis.\n\n"
+        f"Draft:\n{draft}"
+    )
+
+    text = ai_text(prompt)
+
+    # Accept the AI text only if it kept the key facts.
+    must_keep = []
+
+    if facts["hotel"]:
+        must_keep.append(facts["hotel"]["name"])
+
+    if facts["departure"] :
+        must_keep.append(facts["departure"].get("place",""))
+
+    if (
+        text
+        and len(text) < 1500
+        and all(item.lower() in text.lower() for item in must_keep if item)
+    ):
+        conn.execute(
+            "UPDATE trips SET ai_summary = ?, summary_hash = ? WHERE id = ?",
+            (text, facts_hash, trip_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return {"summary": text, "ai_used": True}
+
+    conn.close()
+
+    return {"summary": draft, "ai_used": False}

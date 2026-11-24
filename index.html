@@ -1,219 +1,411 @@
-<!DOCTYPE html>
 
+<!DOCTYPE html>
 <html lang="en">
 
 <head>
-
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-    <title>ROAMLY — Plan less. Roam more.</title>
-
+    <title>Your World. Your Way.</title>
     <link rel="stylesheet" href="style.css">
-
 </head>
 
 <body>
 
-    <!-- Navigation Bar -->
-
     <nav class="navbar">
-
-        <div class="logo">
-            ✈️ ROAMLY
-        </div>
+        <div class="logo">ROAMLY</div>
 
         <div class="nav-links">
-
-            <a href="#">Home</a>
-            <a href="#">Explore</a>
-            <a href="#">My Trips</a>
-
+            <a href="#" id="nav-home">Home</a>
+            <a href="#planner-card" id="nav-explore">Explore</a>
+            <a href="#" id="nav-trips">My Trips</a>
+            <a href="#" id="nav-auth">Sign In</a>
         </div>
-
     </nav>
-
-
-    <!-- Main Section -->
 
     <main>
 
         <section class="hero">
 
             <h1>
-                Plan less.<br>
-                Roam more.
+                Your World.<br>
+                Your Way.
             </h1>
 
             <p>
-                Your AI-powered travel companion for smarter routes,
-                stays, budgets and unforgettable places.
+                Your AI-powered travel companion - from planning to exploring.
             </p>
 
-
-            <!-- Hero Visual -->
-
             <div class="hero-visual">
-
                 <div class="orbit orbit-one"></div>
-
                 <div class="orbit orbit-two"></div>
+                <div class="travel-globe">🌍</div>
+                <div class="floating-icon plane">✈️</div>
+                <div class="floating-icon location">📍</div>
+                <div class="floating-icon suitcase">🧳</div>
+            </div>
 
-                <div class="travel-globe">
-                    🌍
+            <div class="planner-card" id="planner-card">
+
+                <h2>Where will you go next?</h2>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="from">From</label>
+                        <input type="text" id="from" placeholder="Enter starting location">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="destination">Destination</label>
+                        <input type="text" id="destination" placeholder="Enter destination">
+                    </div>
                 </div>
 
-                <div class="floating-icon plane">
-                    ✈️
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="start-date">Start Date</label>
+                        <input type="date" id="start-date">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="end-date">End Date</label>
+                        <input type="date" id="end-date">
+                    </div>
                 </div>
 
-                <div class="floating-icon location">
-                    📍
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="people">Travelers</label>
+                        <input type="number" id="people" min="1" value="1">
+                    </div>
                 </div>
 
-                <div class="floating-icon suitcase">
-                    🧳
-                </div>
+                <button id="plan-button">Plan My Trip</button>
 
             </div>
 
+        </section>
 
-            <!-- Travel Planning Form -->
+        <section id="results" class="results">
 
-            <div class="planner-card">
+            <button type="button" id="back-button" class="back-button">
+                &lt;- Back to search
+            </button>
 
-                <h2>
-                    Where will you go next?✨
-                </h2>
+            <h2>Your Travel Plan</h2>
 
+            <div class="dashboard">
 
-                <!-- From -->
+                <aside class="dash-menu">
+                    <h3>Menu</h3>
+
+                    <button type="button" class="menu-item active" data-view="transport">
+                        Transport
+                    </button>
+
+                    <button type="button" class="menu-item" data-view="hotels">
+                        Hotels
+                    </button>
+
+                    <!-- CATEGORY-WISE BUDGET LIMITS -->
+                    <div class="planning-budget-controls">
+
+                        <h3>Set Your Budget</h3>
+
+                        <div class="budget-input-group">
+                            <label for="max-transport-budget">
+                                Maximum Transport Budget (₹)
+                            </label>
+
+                            <input
+                                type="number"
+                                id="max-transport-budget"
+                                min="1"
+                                step="100"
+                                placeholder="Enter transport limit">
+                        </div>
+
+                        <div class="budget-input-group">
+                            <label for="max-hotel-budget">
+                                Maximum Hotel Budget (₹)
+                            </label>
+
+                            <input
+                                type="number"
+                                id="max-hotel-budget"
+                                min="1"
+                                step="100"
+                                placeholder="Enter hotel limit">
+                        </div>
+
+                        <p class="budget-help-text">
+                            Options exceeding your category budget will not be included
+                            in your running total.
+                        </p>
+
+                    </div>
+
+                </aside>
+
+                <div id="result-content" class="dash-center" data-view="transport">
+                    <p>Your personalized itinerary will appear here.</p>
+                </div>
+
+                <aside class="dash-total">
+                    <h3>Running Total</h3>
+
+                    <div id="total-panel-body"></div>
+
+                    <button type="button" id="save-trip-button" class="save-trip-button auth-hidden">
+                        Finalize this trip
+                    </button>
+
+                    <small id="save-trip-status" class="save-trip-status"></small>
+                </aside>
+
+            </div>
+
+        </section>
+
+        <section id="auth-screen" class="screen">
+
+            <div class="auth-card">
+
+                <h2 id="auth-title">Sign in</h2>
+                <p id="auth-notice" class="auth-notice"></p>
+
+                <div class="auth-tabs">
+                    <button type="button" id="tab-signin" class="auth-tab active">
+                        Sign in
+                    </button>
+
+                    <button type="button" id="tab-signup" class="auth-tab">
+                        Create account
+                    </button>
+                </div>
+
+                <div class="form-group auth-hidden" id="auth-name-group">
+                    <label for="auth-name">Name</label>
+                    <input type="text" id="auth-name" placeholder="Your full name">
+                </div>
 
                 <div class="form-group">
-
-                    <label for="from">
-                        From
-                    </label>
-
-                    <input
-                        type="text"
-                        id="from"
-                        placeholder="Enter starting location"
-                    >
-
+                    <label for="auth-email">Email</label>
+                    <input type="email" id="auth-email" placeholder="you@example.com">
                 </div>
-
-
-                <!-- Destination -->
 
                 <div class="form-group">
-
-                    <label for="destination">
-                        Destination
-                    </label>
-
-                    <input
-                        type="text"
-                        id="destination"
-                        placeholder="Enter destination"
-                    >
-
+                    <label for="auth-password">Password</label>
+                    <input type="password" id="auth-password" placeholder="At least 6 characters">
                 </div>
 
+                <p id="auth-error" class="auth-error"></p>
 
-                <!-- Dates -->
-
-                <div class="form-row">
-
-                    <div class="form-group">
-
-                        <label for="start-date">
-                            Start Date
-                        </label>
-
-                        <input
-                            type="date"
-                            id="start-date"
-                        >
-
-                    </div>
-
-
-                    <div class="form-group">
-
-                        <label for="end-date">
-                            End Date
-                        </label>
-
-                        <input
-                            type="date"
-                            id="end-date"
-                        >
-
-                    </div>
-
-                </div>
-
-
-                <!-- Travelers + Budget Information -->
-
-                <div class="form-row">
-
-                    <div class="form-group">
-
-                        <label for="people">
-                            Travelers
-                        </label>
-
-                        <input
-                            type="number"
-                            id="people"
-                            min="1"
-                            value="1"
-                        >
-
-                    </div>
-
-                </div>
-
-                <!-- Plan Button -->
-
-                <button id="plan-button">
-
-                    ✨ Plan My Trip
-
+                <button type="button" id="auth-submit" class="main-button">
+                    Sign in
                 </button>
 
             </div>
 
         </section>
 
+        <section id="trips-screen" class="screen">
 
-        <!-- Results Section -->
+            <h2>My Trips</h2>
+            <div id="trips-list"></div>
 
-        <section id="results" class="results">
+        </section>
 
-            <h2>
-                Your Travel Plan
-            </h2>
+        
+        <section id="journey-screen" class="screen">
 
-            <div id="result-content">
+            <div class="journey-header">
 
-                <p>
-                    Your personalized itinerary will appear here.
-                </p>
+                <button
+                    type="button"
+                    id="journey-back-button"
+                    class="main-button">
+                    ← Back to My Trips
+                </button>
+
+                <h1 id="journey-title">Your Trip</h1>
+                <p id="journey-subtitle"></p>
+
+            </div>
+
+            <div class="journey-layout">
+
+                <!-- LEFT SIDEBAR -->
+                <aside class="journey-sidebar">
+
+                    <h2>Journey Menu</h2>
+
+                    <button
+                        type="button"
+                        class="journey-menu-item"
+                        data-journey-panel="transport"
+                        aria-pressed="false">
+
+                        <span class="journey-menu-icon">✈️</span>
+
+                        <span>
+                            Navigate to your airport/station
+                        </span>
+
+                        <span class="journey-menu-arrow">›</span>
+
+                    </button>
+
+                    <button
+                        type="button"
+                        class="journey-menu-item"
+                        data-journey-panel="hotel"
+                        aria-pressed="false">
+
+                        <span class="journey-menu-icon">🏨</span>
+
+                        <span>
+                            Navigate to your selected Hotel
+                        </span>
+
+                        <span class="journey-menu-arrow">›</span>
+
+                    </button>
+
+                    <button
+                        type="button"
+                        class="journey-menu-item"
+                        data-journey-panel="places"
+                        aria-pressed="false">
+
+                        <span class="journey-menu-icon">📍</span>
+
+                        <span id="journey-places-label">
+                            Places to explore
+                        </span>
+
+                        <span class="journey-menu-arrow">›</span>
+
+                    </button>
+
+                    <button
+                        type="button"
+                        class="journey-menu-item"
+                        data-journey-panel="weather"
+                        aria-pressed="false">
+
+                        <span class="journey-menu-icon">🌦️</span>
+
+                        <span>
+                            Weather Forecast
+                        </span>
+
+                        <span class="journey-menu-arrow">›</span>
+
+                    </button>
+
+                </aside>
+
+
+                <!-- RIGHT CONTENT AREA -->
+                <main class="journey-main">
+
+                    <div
+                        id="journey-empty-state"
+                        class="journey-empty-state">
+
+                        <div class="journey-empty-icon">🧭</div>
+
+                        <h2>Your journey starts here</h2>
+
+                        <p>
+                            Select an option from the left menu to
+                            view your navigation details and explore
+                            your destination.
+                        </p>
+
+                    </div>
+
+
+                    <!-- TRANSPORT PANEL -->
+                    <section
+                        id="journey-transport-panel"
+                        class="journey-panel"
+                        hidden>
+
+                        <h2>Navigate to your airport/station</h2>
+
+                        <div id="journey-transport-content">
+                            Loading transport details...
+                        </div>
+
+                    </section>
+
+
+                    <!-- HOTEL PANEL -->
+                    <section
+                        id="journey-hotel-panel"
+                        class="journey-panel"
+                        hidden>
+
+                        <h2>Navigate to your selected Hotel</h2>
+
+                        <div id="journey-hotel-content">
+                            Loading hotel details...
+                        </div>
+
+                    </section>
+
+
+                    <!-- PLACES PANEL -->
+                    <section
+                        id="journey-places-panel"
+                        class="journey-panel"
+                        hidden>
+
+                        <h2 id="journey-places-heading">
+                            Places to explore
+                        </h2>
+
+                        <div id="journey-attractions-content">
+                            Loading attractions...
+                        </div>
+
+                    </section>
+
+                    <!-- WEATHER FORECAST PANEL -->
+                    <section
+                        id="journey-weather-panel"
+                        class="journey-panel"
+                        hidden>
+
+                        <h2>🌦️ Weather Forecast</h2>
+
+                        <p class="data-note">
+                            Weather conditions for your destination during your trip.
+                        </p>
+
+                        <div id="journey-weather-content">
+                            Select Weather Forecast to load weather information.
+                        </div>
+
+                    </section>
+
+                </main>
+
+                <!-- RIGHT PANEL: EXPENSES -->
+                <aside class="journey-expenses">
+                    <h2>Trip Expenses</h2>
+                    <div id="expense-panel-body"></div>
+                </aside>
 
             </div>
 
         </section>
 
+
     </main>
 
-
-    <!-- JavaScript -->
-
-    <script src="script.js"></script>
+    <script src="script.js" defer></script>
 
 </body>
-
 </html>
